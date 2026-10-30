@@ -875,10 +875,16 @@ class ObjectStoreStorage extends Common implements IChunkedFileWrite {
 			$stat = $this->stat($targetPath);
 			$mtime = time();
 			if (is_array($stat)) {
+				$sizeDifference = $size - (int)$stat['size'];
 				$stat['size'] = $size;
 				$stat['mtime'] = $mtime;
+				$stat['storage_mtime'] = $mtime;
 				$stat['mimetype'] = $this->getMimeType($targetPath);
+				$stat['etag'] = $this->getETag($targetPath);
+				$stat['checksum'] = '';
+				$stat['unencrypted_size'] = $size;
 				$this->getCache()->update($stat['fileid'], $stat);
+				$this->getPropagator()->propagateChange($targetPath, $mtime, $sizeDifference);
 			}
 		} catch (S3MultipartUploadException|S3Exception $e) {
 			$this->logger->error(

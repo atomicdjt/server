@@ -214,9 +214,14 @@ class ChunkingV2Plugin extends ServerPlugin {
 		// Refresh the session metadata TTL on every successful chunk
 		$this->storeUploadSession();
 
-		$storage->getCache()->update($uploadFile->getId(), ['size' => $uploadFile->getSize() + $additionalSize]);
-		if ($tempTargetFile) {
-			$storage->getPropagator()->propagateChange($tempTargetFile->getInternalPath(), time(), $additionalSize);
+		// Multipart parts are not part of an overwritten object until completion. Keep the
+		// temporary upload target's size for quota checks, but defer direct object-store updates
+		// until completion, when the committed size difference is known.
+		if (!$storage->instanceOfStorage(ObjectStoreStorage::class) || $tempTargetFile !== null) {
+			$storage->getCache()->update($uploadFile->getId(), ['size' => $uploadFile->getSize() + $additionalSize]);
+			if ($tempTargetFile) {
+				$storage->getPropagator()->propagateChange($tempTargetFile->getInternalPath(), time(), $additionalSize);
+			}
 		}
 
 		$response->setStatus(201);

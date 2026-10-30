@@ -992,6 +992,16 @@ trait WebDav {
 		}
 	}
 
+	#[When('user :user cancels new chunking v2 upload with id :id')]
+	public function userCancelsNewChunkingv2Upload($user, $id): void {
+		$destination = '/uploads/' . $user . '/' . $this->getUploadId($id);
+		try {
+			$this->response = $this->makeDavRequest($user, 'DELETE', $destination, [], null, 'uploads');
+		} catch (\GuzzleHttp\Exception\BadResponseException $e) {
+			$this->response = $e->getResponse();
+		}
+	}
+
 	private function getTargetDestination(string $user, string $destination): string {
 		return substr($this->baseUrl, 0, -4) . $this->getDavFilesPath($user) . $destination;
 	}
@@ -1206,6 +1216,13 @@ trait WebDav {
 		$randomletter = substr(str_shuffle('abcdefghijklmnopqrstuvwxyz'), 0, 1);
 		file_put_contents('/tmp/part-upload-' . $id, str_repeat($randomletter, (int)$size * 1024 * 1024));
 		$this->parts[] = '/tmp/part-upload-' . $id;
+	}
+
+	#[Given('user :user creates a deterministic chunk :id filled with :character and size :size MB')]
+	public function userCreatesDeterministicChunk($user, $id, $character, $size): void {
+		$path = '/tmp/part-upload-' . $id;
+		file_put_contents($path, str_repeat(substr($character, 0, 1), (int)$size * 1024 * 1024));
+		$this->parts = [$path];
 	}
 
 	#[Then('/^Downloaded content should be the created file$/')]

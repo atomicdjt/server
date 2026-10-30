@@ -8,11 +8,17 @@
 
 namespace Test\Files\ObjectStore;
 
+use Aws\Multipart\UploadState;
+use Aws\Result;
+use Aws\S3\Exception\S3MultipartUploadException;
 use OC\Files\ObjectStore\StorageObjectStore;
 use OC\Files\Storage\Temporary;
 use OC\Files\Storage\Wrapper\Jail;
+use OC\Files\Storage\Wrapper\Quota;
 use OCP\Constants;
+use OCP\Files\GenericFileException;
 use OCP\Files\ObjectStore\IObjectStore;
+use OCP\Files\ObjectStore\IObjectStoreMultiPartUpload;
 use Test\Files\Storage\Storage;
 
 #[\PHPUnit\Framework\Attributes\Group('DB')]
@@ -25,12 +31,14 @@ class ObjectStoreStorageTest extends Storage {
 	 */
 	private $objectStorage;
 
+	private Temporary $baseStorage;
+
 	#[\Override]
 	protected function setUp(): void {
 		parent::setUp();
 
-		$baseStorage = new Temporary();
-		$this->objectStorage = new StorageObjectStore($baseStorage);
+		$this->baseStorage = new Temporary();
+		$this->objectStorage = new StorageObjectStore($this->baseStorage);
 		$config['objectstore'] = $this->objectStorage;
 		$this->instance = new ObjectStoreStorageOverwrite($config);
 	}
@@ -181,6 +189,185 @@ class ObjectStoreStorageTest extends Storage {
 
 		$this->instance->file_put_contents('test.txt', 'foo');
 		$this->assertTrue($this->instance->file_exists('test.txt'));
+	}
+
+	public function testChunkedOverwritesRefreshMetadataAndPropagateQuotaSizeDeltas(): void {
+		$multipartStore = new class($this->baseStorage) extends StorageObjectStore implements IObjectStoreMultiPartUpload {
+			private array $parts = [];
+			public bool $failNextCompletion = false;
+			public int $abortCount = 0;
+			public array $completedPartNumbers = [];
+
+			public function initiateMultipartUpload(string $urn): string {
+				return 'upload-token';
+			}
+
+			public function uploadMultipartPart(
+				string $urn,
+				string $uploadId,
+				int $partId,
+				$stream,
+				$size,
+			): Result {
+				$data = stream_get_contents($stream);
+				$this->parts[$urn][$uploadId][$partId] = $data;
+				return new Result(['ETag' => '"' . md5($data) . '"']);
+			}
+
+			public function completeMultipartUpload(string $urn, string $uploadId, array $result): int {
+				if ($this->failNextCompletion) {
+					$this->failNextCompletion = false;
+					throw new S3MultipartUploadException(new UploadState(['Key' => $urn]));
+				}
+				$this->completedPartNumbers = array_column($result, 'PartNumber');
+				$data = '';
+				foreach ($result as $part) {
+					$data .= $this->parts[$urn][$uploadId][$part['PartNumber']];
+				}
+				$stream = fopen('php://temp', 'w+b');
+				fwrite($stream, $data);
+				rewind($stream);
+				$this->writeObject($urn, $stream);
+				fclose($stream);
+				unset($this->parts[$urn][$uploadId]);
+				return strlen($data);
+			}
+
+			public function abortMultipartUpload(string $urn, string $uploadId): void {
+				$this->abortCount++;
+				unset($this->parts[$urn][$uploadId]);
+			}
+
+			public function getMultipartUploads(string $urn, string $uploadId): array {
+				$uploads = [];
+				foreach ($this->parts[$urn][$uploadId] ?? [] as $partId => $data) {
+					$uploads[$partId] = [
+						'PartNumber' => $partId,
+						'ETag' => '"' . md5($data) . '"',
+						'Size' => strlen($data),
+					];
+				}
+				return $uploads;
+			}
+		};
+
+		$this->instance->setObjectStore($multipartStore);
+		$this->instance->mkdir('folder');
+		$this->instance->file_put_contents('folder/target.txt', 'old data');
+		$fileCache = $this->instance->getCache();
+		$file = $fileCache->get('folder/target.txt');
+		$oldSize = $file->getSize();
+		$fileCache->update($file->getId(), [
+			'mtime' => 1,
+			'storage_mtime' => 1,
+			'checksum' => 'old-checksum',
+			'unencrypted_size' => $oldSize,
+		]);
+		$file = $fileCache->get('folder/target.txt');
+		$oldEtag = $file->getEtag();
+		$oldMtime = $file->getMTime();
+		$oldStorageMtime = $file->getStorageMTime();
+		$folder = $fileCache->get('folder');
+		$root = $fileCache->get('');
+		$fileCache->update($folder->getId(), ['size' => $oldSize]);
+		$fileCache->update($root->getId(), ['size' => $oldSize]);
+		$quota = new Quota(['storage' => $this->instance, 'quota' => 20, 'root' => '']);
+		$this->assertSame(12, $quota->free_space('folder'));
+
+		$uploadId = $this->instance->startChunkedWrite('folder/target.txt');
+		foreach ([2 => 'content', 1 => 'new-'] as $partId => $data) {
+			$part = fopen('php://temp', 'w+b');
+			fwrite($part, $data);
+			rewind($part);
+			$this->instance->putChunkedWritePart('folder/target.txt', $uploadId, (string)$partId, $part, strlen($data));
+			fclose($part);
+		}
+
+		// Uploaded multipart parts must not alter the cached, still-committed file or quota usage.
+		$this->assertSame($oldSize, $fileCache->get('folder/target.txt')->getSize());
+		$this->assertSame($oldSize, $fileCache->get('folder')->getSize());
+		$this->assertSame($oldSize, $fileCache->get('')->getSize());
+		$this->assertSame(12, $quota->free_space('folder'));
+
+		$this->assertSame(11, $this->instance->completeChunkedWrite('folder/target.txt', $uploadId));
+
+		$file = $fileCache->get('folder/target.txt');
+		$this->assertSame(11, $file->getSize());
+		$this->assertNotSame($oldEtag, $file->getEtag());
+		$this->assertGreaterThan(0, $file->getMTime());
+		$this->assertNotSame($oldMtime, $file->getMTime());
+		$this->assertNotSame($oldStorageMtime, $file->getStorageMTime());
+		$this->assertSame($file->getMTime(), $file->getStorageMTime());
+		$this->assertSame(11, $file['unencrypted_size']);
+		$this->assertSame('', $file['checksum']);
+		$this->assertSame('new-content', $this->instance->file_get_contents('folder/target.txt'));
+		$this->assertSame(11, $fileCache->get('folder')->getSize());
+		$this->assertSame(11, $fileCache->get('')->getSize());
+		$this->assertSame(9, $quota->free_space('folder'));
+		$this->assertSame([1, 2], $multipartStore->completedPartNumbers);
+
+		$etag = $file->getEtag();
+		$uploadId = $this->instance->startChunkedWrite('folder/target.txt');
+		$part = fopen('php://temp', 'w+b');
+		fwrite($part, 'tiny');
+		rewind($part);
+		$this->instance->putChunkedWritePart('folder/target.txt', $uploadId, '1', $part, 4);
+		fclose($part);
+		$this->instance->completeChunkedWrite('folder/target.txt', $uploadId);
+		$file = $fileCache->get('folder/target.txt');
+		$this->assertSame(4, $file->getSize());
+		$this->assertNotSame($etag, $file->getEtag());
+		$this->assertSame(4, $fileCache->get('folder')->getSize());
+		$this->assertSame(4, $fileCache->get('')->getSize());
+		$this->assertSame(16, $quota->free_space('folder'));
+
+		$etag = $file->getEtag();
+		$uploadId = $this->instance->startChunkedWrite('folder/target.txt');
+		$part = fopen('php://temp', 'w+b');
+		fwrite($part, 'more');
+		rewind($part);
+		$this->instance->putChunkedWritePart('folder/target.txt', $uploadId, '1', $part, 4);
+		fclose($part);
+		$this->instance->completeChunkedWrite('folder/target.txt', $uploadId);
+		$file = $fileCache->get('folder/target.txt');
+		$this->assertSame(4, $file->getSize());
+		$this->assertNotSame($etag, $file->getEtag());
+		$this->assertSame(4, $fileCache->get('folder')->getSize());
+		$this->assertSame(16, $quota->free_space('folder'));
+
+		$uploadId = $this->instance->startChunkedWrite('folder/target.txt');
+		$part = fopen('php://temp', 'w+b');
+		fwrite($part, 'abandoned');
+		rewind($part);
+		$this->instance->putChunkedWritePart('folder/target.txt', $uploadId, '1', $part, 9);
+		fclose($part);
+		$this->assertSame(4, $fileCache->get('folder/target.txt')->getSize());
+		$this->assertSame(4, $fileCache->get('folder')->getSize());
+		$this->assertSame(16, $quota->free_space('folder'));
+		$this->instance->cancelChunkedWrite('folder/target.txt', $uploadId);
+		$this->assertSame(1, $multipartStore->abortCount);
+		$this->assertSame(4, $fileCache->get('folder/target.txt')->getSize());
+		$this->assertSame('more', $this->instance->file_get_contents('folder/target.txt'));
+
+		$uploadId = $this->instance->startChunkedWrite('folder/target.txt');
+		$part = fopen('php://temp', 'w+b');
+		fwrite($part, 'failed');
+		rewind($part);
+		$this->instance->putChunkedWritePart('folder/target.txt', $uploadId, '1', $part, 6);
+		fclose($part);
+		$multipartStore->failNextCompletion = true;
+		try {
+			$this->instance->completeChunkedWrite('folder/target.txt', $uploadId);
+			$this->fail('Expected multipart completion to fail');
+		} catch (GenericFileException $e) {
+			$this->assertSame('Could not write chunked file', $e->getMessage());
+		}
+		$this->assertSame(2, $multipartStore->abortCount);
+		$this->assertSame(4, $fileCache->get('folder/target.txt')->getSize());
+		$this->assertSame(4, $fileCache->get('folder')->getSize());
+		$this->assertSame(4, $fileCache->get('')->getSize());
+		$this->assertSame(16, $quota->free_space('folder'));
+		$this->assertSame('more', $this->instance->file_get_contents('folder/target.txt'));
 	}
 
 	public function testDeleteObjectFailureKeepCache(): void {

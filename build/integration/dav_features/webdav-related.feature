@@ -746,6 +746,46 @@ Feature: webdav-related
 		And Downloading file "/üäöé/äöü.txt"
 		Then Downloaded content should be the created file
 
+	@s3-multipart @65060
+	Scenario: Overwriting a chunked S3 file keeps committed size and ETag consistent
+		Given using new dav path
+		And user "user0" exists
+		And user "user0" created a folder "/issue-65060"
+		And user "user0" creates a deterministic chunk "1" filled with "A" and size "6" MB
+		And user "user0" creates a new chunking v2 upload with id "issue-65060-initial" and destination "/issue-65060/file.bin"
+		And user "user0" uploads new chunk v2 file "1" to id "issue-65060-initial"
+		And user "user0" moves new chunk v2 file with id "issue-65060-initial"
+		Then the S3 multipart upload was successful with status "201"
+		And user "user0" stores etag of element "/issue-65060/file.bin"
+		When as "user0" gets properties of folder "/issue-65060/file.bin" with
+			|{http://owncloud.org/ns}size|
+		Then the single response should contain a property "{http://owncloud.org/ns}size" with value "6291456"
+		Given user "user0" creates a deterministic chunk "1" filled with "C" and size "11" MB
+		And user "user0" creates a new chunking v2 upload with id "issue-65060-cancel" and destination "/issue-65060/file.bin"
+		And user "user0" uploads new chunk v2 file "1" to id "issue-65060-cancel"
+		When user "user0" cancels new chunking v2 upload with id "issue-65060-cancel"
+		Then the HTTP status code should be "204"
+		And etag of element "/issue-65060/file.bin" of user "user0" has not changed
+		When as "user0" gets properties of folder "/issue-65060/file.bin" with
+			|{http://owncloud.org/ns}size|
+		Then the single response should contain a property "{http://owncloud.org/ns}size" with value "6291456"
+		And user "user0" creates a deterministic chunk "1" filled with "A" and size "6" MB
+		When As an "user0"
+		And Downloading file "/issue-65060/file.bin"
+		Then Downloaded content should be the created file
+		And user "user0" creates a deterministic chunk "1" filled with "B" and size "11" MB
+		And user "user0" creates a new chunking v2 upload with id "issue-65060-final" and destination "/issue-65060/file.bin"
+		And user "user0" uploads new chunk v2 file "1" to id "issue-65060-final"
+		And user "user0" moves new chunk v2 file with id "issue-65060-final"
+		Then the S3 multipart upload was successful with status "204"
+		And etag of element "/issue-65060/file.bin" of user "user0" has changed
+		When as "user0" gets properties of folder "/issue-65060" with
+			|{http://owncloud.org/ns}size|
+		Then the single response should contain a property "{http://owncloud.org/ns}size" with value "11534336"
+		When As an "user0"
+		And Downloading file "/issue-65060/file.bin"
+		Then Downloaded content should be the created file
+
 	@requires-s3
 	Scenario: Cannot overwrite a file the user may not update with new chunking v2
 		Given using new dav path
